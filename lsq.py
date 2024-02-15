@@ -4,9 +4,13 @@
 
 # The code below is for the Gaussian kernel with fixed bandwidth, k(x,y) := exp(-||x-y||_2^2).
 # The bandwidth can be changed by scaling the input point coordinates.
-
+#%% Import and function defintions
 import numpy as np
+import pandas as pd
 import scipy as sp
+import scipy.integrate as integrate
+from scipy.stats import gaussian_kde
+from tqdm import tqdm
 
 
 ### Auxiliary : computing squared-distance matrix ###
@@ -62,6 +66,10 @@ class LSQ_RFF:
     def private_kde(self, queries):
         return (1./self.reps) * np.dot(self.sanitized_rff_kde, self.apply_rff(queries).T)
 
+    def one_number_kde(self, number, sanitized: bool):
+        if sanitized:
+            return self.private_kde(np.array(number))
+        return self.non_private_kde(np.array(number))
 
 ### LSQ with Fast Gauss Transform ###
 
@@ -148,47 +156,119 @@ class LSQ_FGT:
             dataset_sketch = self.sketch
         q_sketch, relevant_cells = self.g(query)
         return dataset_sketch[relevant_cells, :].ravel().dot(q_sketch.ravel())
+    
+    def one_number_kde(self, number: float, sanitized: bool):
+        return self.one_query_kde(np.array(number), sanitized)
 
     def non_private_kde(self, queries):
         return np.array([self.one_query_kde(query, False) for query in queries])
 
     def private_kde(self, queries):
         return np.array([self.one_query_kde(query, True) for query in queries])
+    
+    def approximate_cdf(self, query, sanitized=False):
+        """
+        Approximate the cumulative distribution function at a given query point.
 
+        Args:
+        - query: A single query point as a numpy array.
+        - sanitized: Boolean flag to use sanitized sketch or not.
 
+        Returns:
+        - Approximated CDF value at the query point.
+        """
+        # Generate a sequence of points from the minimum to the query point
+        points = np.linspace(0, query, num=100)  # Adjust the range and num as per your dataset
+        cdf_value = 0
+        
+        for point in points:
+            # For each point, calculate the KDE and sum it to approximate the integral
+            point_kde = self.one_query_kde(np.array([point]), sanitized)
+            cdf_value += point_kde
+        
+        # Normalize the approximate integral by the number of points and the range
+        cdf_value /= len(points)
+        
+        return cdf_value
+
+class Mechanism:
+    def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, mechanism_parameters = None):
+        self.mechanism_name = mechanism_name
+        if mechanism_name == 'SCIPY':
+            self.mechanism_class = gaussian_kde
+        elif mechanism_name == 'LSQ_RFF':
+            self.mechanism_class = LSQ_RFF
+        elif mechanism_name == 'LSQ_FGT':
+            self.mechanism_class = LSQ_FGT
+        self.sanitized = sanitized
+        self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
+    
+    def setup_mechanism(self, dataset):
+        if self.mechanism_name == 'SCIPY':
+            self.mechanism_instance = self.mechanism_class(dataset.T, **self.mechanism_parameters)
+        elif self.mechanism_name == 'LSQ_FGT':
+            self.mechanism_instance = self.mechanism_class(dataset, 
+                                                           dimension = 1, 
+                                                           coordinate_range = int(np.ceil(dataset.max() + 1)),
+                                                           **self.mechanism_parameters)
+            if self.sanitized:
+                self.mechanism_instance.sanitize(1.0)
+        elif self.mechanism_name == 'LSQ_RFF':
+            self.mechanism_instance = self.mechanism_class(dataset, 
+                                                           dimension = 1, 
+                                                           **self.mechanism_parameters)
+            if self.sanitized:
+                self.mechanism_instance.sanitize(1.0)
+        
+    def compute_cdf_with_integral(self, point):
+        if self.mechanism_name == 'SCIPY':
+            pdf = lambda x: self.mechanism_instance.pdf(np.array([x]))
+        else:
+            pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
+        return integrate.quad(pdf, 0, point, limit = 1000, epsabs = 0.001)[0]
+            
+        
+def compare_mechanisms(mechanisms: list, n_values: list):
+    np.random.seed(42)
+    comparison = {'mechanism': [mechanism.mechanism_name for mechanism in mechanisms],
+                  'sanitized': [mechanism.sanitized for mechanism in mechanisms]}
+    for n in np.sort(n_values):
+        choices = np.array(range(0, n))
+        dataset = np.random.choice(choices, (10**6, 1))
+        cdfs = []
+        # loop through the mechanisms
+        for mechanism in mechanisms:
+            # setup the mechanism
+            mechanism.setup_mechanism(dataset)
+            # compute the cdf value at the maximum value
+            cdfs.append(mechanism.compute_cdf_with_integral(n - 1))
+        comparison[f'cdf_for_domain_size_{n}'] = cdfs
+        print(f"CDFs for domain size {n} computed.")
+    # also compute the cdfs for a continuous variable
+    dataset = np.random.uniform(0, 1, (10**6, 1))
+    cdfs = []
+    # loop through the mechanisms
+    for mechanism in mechanisms:
+        # setup the mechanism
+        mechanism.setup_mechanism(dataset)
+        # compute the cdf value at the maximum value
+        cdfs.append(mechanism.compute_cdf_with_integral(1))
+        comparison[f'cdf_for_continous_domain'] = cdfs
+    comparison = pd.DataFrame.from_dict(comparison)
+    print(f"CDFs for continuous domain computed.")
+    return comparison
+    
+#%% Execute the demo
 if __name__ == '__main__':
     ### Usage example ###
+    scipy_kde = Mechanism(mechanism_name = 'SCIPY')
+    lsq_rff_kde = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = False, mechanism_parameters = {'reps': 1000})
+    lsq_rff_kde_dp = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = True, mechanism_parameters = {'reps': 1000})
+    lsq_fgt_kde = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 6})
+    lsq_fgt_kde_dp = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 6})
+    mechanisms = [scipy_kde, lsq_rff_kde, lsq_rff_kde_dp, lsq_fgt_kde, lsq_fgt_kde_dp]
+    n_values = [5, 10, 100, 1000, 5000]
+    comparison = compare_mechanisms(mechanisms, n_values)
+    
 
-    # Generate random dataset and queries:
-    dimension = 2
-    coordinate_range = 10
-    n_data = 100000
-    n_queries = 20
-    dataset = np.random.uniform(0, coordinate_range-1, (n_data, dimension))
-    queries = np.random.uniform(0, coordinate_range-1, (n_queries, dimension))
-
-    method = "lsq-rff" # or "lsq-fgt"
-    print("DP-KDE method:", method)
-
-    if method == "lsq-rff":
-        # Init LSQ-RFF:
-        num_features = 200
-        mechanism = LSQ_RFF(dataset, dimension, num_features)
-    elif method == "lsq-fgt":
-        # init LSQ-FGT:
-        rho = 4
-        mechanism = LSQ_FGT(dataset, dimension, coordinate_range, rho)
-
-    # Exact Gaussian KDE:
-    exact_kde = GaussianKDE(dataset, queries)
-    print("Exact:", exact_kde)
-    # Non-DP KDE estimates:
-    non_dp_kde_estimate = mechanism.non_private_kde(queries)
-    print("Non-DP estimate:", non_dp_kde_estimate)
-    print("Mean error:", np.mean(np.abs(exact_kde - non_dp_kde_estimate)))
-    # DP KDE estimates:
-    epsilon = 0.5
-    mechanism.sanitize(epsilon)
-    dp_kde_estimate = mechanism.private_kde(queries)
-    print("DP estimate:", dp_kde_estimate)
-    print("Mean error:", np.mean(np.abs(exact_kde - dp_kde_estimate)))
+# %%
