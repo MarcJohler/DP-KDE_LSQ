@@ -10,6 +10,7 @@ import pandas as pd
 import scipy as sp
 import scipy.integrate as integrate
 from scipy.stats import gaussian_kde
+from scipy.optimize import minimize_scalar
 import math
 
 
@@ -201,7 +202,8 @@ class Mechanism:
             self.mechanism_class = LSQ_FGT
         self.sanitized = sanitized
         self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
-    
+        self._pdf_multiplicator = 1.0
+        
     def setup_mechanism(self, dataset, epsilon: int = 1.0):
         if self.mechanism_name == 'SCIPY':
             self.mechanism_instance = self.mechanism_class(dataset.T, **self.mechanism_parameters)
@@ -218,29 +220,44 @@ class Mechanism:
                                                            **self.mechanism_parameters)
             if self.sanitized:
                 self.mechanism_instance.sanitize(epsilon)
-        
-    def compute_cdf_with_integral(self, point):
+        self._x_lower_bound = dataset.min()
+        self._x_upper_bound = dataset.max()
+        # Reset the multiplicator in case it was set before
+        self._pdf_multiplicator = 1.0
+        # Now set it to the actual value
+        self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
+    
+    def compute_pdf(self, point):
         if self.mechanism_name == 'SCIPY':
             pdf = lambda x: self.mechanism_instance.pdf(np.array([x]))
         else:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
-        return integrate.quad(pdf, 0, point, limit = 1000, epsabs = 0.001)[0]
-            
+        return(pdf(point) * self._pdf_multiplicator)
         
-def compare_mechanisms(mechanisms: list, n_values: list, epsilons: list):
+    def compute_cdf_with_integral(self, end, start = None):
+        if start is None:
+            start = self._x_lower_bound
+        return integrate.quad(self.compute_pdf, start, end, limit = 1000, epsabs = 0.0001)[0]
+    
+    def inverse_cdf_with_integral(self, q):
+        cdf_diff = lambda y: (self.compute_cdf_with_integral(y) - q)**2
+        return minimize_scalar(cdf_diff, bounds = (self._x_lower_bound, self._x_upper_bound))
+        
+            
+def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n: int):
     np.random.seed(42)
     sanitized = [mechanism.sanitized for mechanism in mechanisms]
     mech_col = [name for name_list in [[mechanism.mechanism_name] * len(epsilons) if mechanism.sanitized else [mechanism.mechanism_name] for mechanism in mechanisms] for name in name_list]
     san_col = [san for san_list in [[True] * len(epsilons) if s else [False] for s in sanitized] for san in san_list]
     eps_col = [eps for eps_list in [epsilons if s else [None] for s in sanitized] for eps in eps_list]    
     comparison = None
-    for n in np.sort(n_values):
-        comparison_for_n = {'mechanism': mech_col,
-                            'sanitized': san_col,
-                            'epsilon': eps_col}
-        choices = np.array(range(0, n))
+    for ds in np.sort(domain_sizess):
+        comparison_for_ds = {'mechanism': mech_col,
+                             'sanitized': san_col,
+                             'epsilon': eps_col}
+        choices = np.array(range(0, ds))
         # we normalize the dataset to speed up computation
-        dataset = np.random.choice(choices, (10**6, 1)) / (n - 1)
+        dataset = np.random.choice(choices, (n, 1)) / (ds - 1)
         cdfs = []
         # loop through the mechanisms
         for mechanism in mechanisms:
@@ -256,17 +273,17 @@ def compare_mechanisms(mechanisms: list, n_values: list, epsilons: list):
                 mechanism.setup_mechanism(dataset, epsilon)
                 # compute the cdf value at the maximum value
                 cdfs.append(mechanism.compute_cdf_with_integral(1))
-        comparison_for_n['domain_size'] = n
-        comparison_for_n['cdf'] = cdfs
-        comparison_for_n = pd.DataFrame.from_dict(comparison_for_n)
-        print(f"CDFs for domain size {n} computed.")
+        comparison_for_ds['domain_size'] = ds
+        comparison_for_ds['cdf'] = cdfs
+        comparison_for_ds = pd.DataFrame.from_dict(comparison_for_ds)
+        print(f"CDFs for domain size {ds} computed.")
         # add to overall comparison
         if comparison is None:
-            comparison = comparison_for_n
+            comparison = comparison_for_ds
         else:
-            comparison = pd.concat([comparison, comparison_for_n], axis = 0, ignore_index = True)
+            comparison = pd.concat([comparison, comparison_for_ds], axis = 0, ignore_index = True)
     # also compute the cdfs for a continuous variable
-    dataset = np.random.uniform(0, 1, (10**6, 1))
+    dataset = np.random.uniform(0, 1, (n, 1))
     cdfs = []
     comparison_for_continuous = {'mechanism': mech_col,
                                  'sanitized': san_col,
@@ -306,10 +323,14 @@ if __name__ == '__main__':
     lsq_fgt_kde = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 10})
     lsq_fgt_kde_dp = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 10})
     mechanisms = [scipy_kde, lsq_rff_kde, lsq_rff_kde_dp, lsq_fgt_kde, lsq_fgt_kde_dp]
-    n_values = [10**(i + 1) for i in range(5)]
-    epsilons = [10**(1 - i) for i in range(5)]
-    comparison = compare_mechanisms(mechanisms, n_values, epsilons)
-    comparison.to_csv("~/outputs/statistics/mechanism_comparison.csv", 
-                      sep = ";", index = False)
+    domain_sizes = [10**(i + 1) for i in range(4)]
+    epsilons = [10**(1 - i) for i in range(4)]
+    comparison = compare_mechanisms(mechanisms, domain_sizes, epsilons, n = 10**4)
+    #comparison.to_csv("~/outputs/statistics/mechanism_comparison.csv", 
+                      #sep = ";", index = False)
 
+# %% Read the computed comparison
+comparison = pd.read_csv("~/outputs/statistics/mechanism_comparison.csv", 
+                         sep = ";", 
+                         decimal = ".")
 # %%
