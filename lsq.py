@@ -10,7 +10,7 @@ import pandas as pd
 import scipy as sp
 import scipy.integrate as integrate
 from scipy.stats import gaussian_kde
-from tqdm import tqdm
+import math
 
 
 ### Auxiliary : computing squared-distance matrix ###
@@ -25,7 +25,6 @@ def get_sqdistance_matrix(M1, M2):
 
 
 ### Exact KDE ###
-
 def GaussianKDE(dataset, queries):
     exp_sq_dist_matrix = np.exp(-1 * get_sqdistance_matrix(dataset, queries))
     return np.mean(exp_sq_dist_matrix, axis=0).T
@@ -203,7 +202,7 @@ class Mechanism:
         self.sanitized = sanitized
         self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
     
-    def setup_mechanism(self, dataset):
+    def setup_mechanism(self, dataset, epsilon: int = 1.0):
         if self.mechanism_name == 'SCIPY':
             self.mechanism_instance = self.mechanism_class(dataset.T, **self.mechanism_parameters)
         elif self.mechanism_name == 'LSQ_FGT':
@@ -212,13 +211,13 @@ class Mechanism:
                                                            coordinate_range = int(np.ceil(dataset.max() + 1)),
                                                            **self.mechanism_parameters)
             if self.sanitized:
-                self.mechanism_instance.sanitize(1.0)
+                self.mechanism_instance.sanitize(epsilon)
         elif self.mechanism_name == 'LSQ_RFF':
             self.mechanism_instance = self.mechanism_class(dataset, 
                                                            dimension = 1, 
                                                            **self.mechanism_parameters)
             if self.sanitized:
-                self.mechanism_instance.sanitize(1.0)
+                self.mechanism_instance.sanitize(epsilon)
         
     def compute_cdf_with_integral(self, point):
         if self.mechanism_name == 'SCIPY':
@@ -228,47 +227,89 @@ class Mechanism:
         return integrate.quad(pdf, 0, point, limit = 1000, epsabs = 0.001)[0]
             
         
-def compare_mechanisms(mechanisms: list, n_values: list):
+def compare_mechanisms(mechanisms: list, n_values: list, epsilons: list):
     np.random.seed(42)
-    comparison = {'mechanism': [mechanism.mechanism_name for mechanism in mechanisms],
-                  'sanitized': [mechanism.sanitized for mechanism in mechanisms]}
+    sanitized = [mechanism.sanitized for mechanism in mechanisms]
+    mech_col = [name for name_list in [[mechanism.mechanism_name] * len(epsilons) if mechanism.sanitized else [mechanism.mechanism_name] for mechanism in mechanisms] for name in name_list]
+    san_col = [san for san_list in [[True] * len(epsilons) if s else [False] for s in sanitized] for san in san_list]
+    eps_col = [eps for eps_list in [epsilons if s else [None] for s in sanitized] for eps in eps_list]    
+    comparison = None
     for n in np.sort(n_values):
+        comparison_for_n = {'mechanism': mech_col,
+                            'sanitized': san_col,
+                            'epsilon': eps_col}
         choices = np.array(range(0, n))
-        dataset = np.random.choice(choices, (10**6, 1))
+        # we normalize the dataset to speed up computation
+        dataset = np.random.choice(choices, (10**6, 1)) / (n - 1)
         cdfs = []
         # loop through the mechanisms
         for mechanism in mechanisms:
-            # setup the mechanism
-            mechanism.setup_mechanism(dataset)
-            # compute the cdf value at the maximum value
-            cdfs.append(mechanism.compute_cdf_with_integral(n - 1))
-        comparison[f'cdf_for_domain_size_{n}'] = cdfs
+            # if mechanism is not sanitized only apply one kde
+            if not mechanism.sanitized:
+                # setup the mechanism
+                mechanism.setup_mechanism(dataset)
+                # compute the cdf value at the maximum value
+                cdfs.append(mechanism.compute_cdf_with_integral(1))
+                continue 
+            for epsilon in epsilons:
+                # setup the mechanism
+                mechanism.setup_mechanism(dataset, epsilon)
+                # compute the cdf value at the maximum value
+                cdfs.append(mechanism.compute_cdf_with_integral(1))
+        comparison_for_n['domain_size'] = n
+        comparison_for_n['cdf'] = cdfs
+        comparison_for_n = pd.DataFrame.from_dict(comparison_for_n)
         print(f"CDFs for domain size {n} computed.")
+        # add to overall comparison
+        if comparison is None:
+            comparison = comparison_for_n
+        else:
+            comparison = pd.concat([comparison, comparison_for_n], axis = 0, ignore_index = True)
     # also compute the cdfs for a continuous variable
     dataset = np.random.uniform(0, 1, (10**6, 1))
     cdfs = []
+    comparison_for_continuous = {'mechanism': mech_col,
+                                 'sanitized': san_col,
+                                 'epsilon': eps_col}
     # loop through the mechanisms
     for mechanism in mechanisms:
-        # setup the mechanism
-        mechanism.setup_mechanism(dataset)
-        # compute the cdf value at the maximum value
-        cdfs.append(mechanism.compute_cdf_with_integral(1))
-        comparison[f'cdf_for_continous_domain'] = cdfs
-    comparison = pd.DataFrame.from_dict(comparison)
+        # if mechanism is not sanitized only apply one kde
+        if not mechanism.sanitized:
+            # setup the mechanism
+            mechanism.setup_mechanism(dataset)
+            # compute the cdf value at the maximum value
+            cdfs.append(mechanism.compute_cdf_with_integral(1))
+            continue 
+        # otherwise loop over epsilons
+        for epsilon in epsilons:
+            # setup the mechanism
+            mechanism.setup_mechanism(dataset, epsilon)
+            # compute the cdf value at the maximum value
+            cdfs.append(mechanism.compute_cdf_with_integral(1))
+    comparison_for_continuous['domain_size'] = math.inf
+    comparison_for_continuous['cdf'] = cdfs
+    comparison_for_continuous = pd.DataFrame.from_dict(comparison_for_continuous)
     print(f"CDFs for continuous domain computed.")
+    # merge into overall comparison
+    if comparison is None:
+        comparison = comparison_for_continuous
+    else:
+        comparison = pd.concat([comparison, comparison_for_continuous], axis = 0, ignore_index = True)
     return comparison
     
 #%% Execute the demo
 if __name__ == '__main__':
     ### Usage example ###
     scipy_kde = Mechanism(mechanism_name = 'SCIPY')
-    lsq_rff_kde = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = False, mechanism_parameters = {'reps': 1000})
-    lsq_rff_kde_dp = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = True, mechanism_parameters = {'reps': 1000})
-    lsq_fgt_kde = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 6})
-    lsq_fgt_kde_dp = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 6})
+    lsq_rff_kde = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = False, mechanism_parameters = {'reps': 2000})
+    lsq_rff_kde_dp = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = True, mechanism_parameters = {'reps': 2000})
+    lsq_fgt_kde = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 10})
+    lsq_fgt_kde_dp = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 10})
     mechanisms = [scipy_kde, lsq_rff_kde, lsq_rff_kde_dp, lsq_fgt_kde, lsq_fgt_kde_dp]
-    n_values = [5, 10, 100, 1000, 5000]
-    comparison = compare_mechanisms(mechanisms, n_values)
-    
+    n_values = [10**(i + 1) for i in range(5)]
+    epsilons = [10**(1 - i) for i in range(5)]
+    comparison = compare_mechanisms(mechanisms, n_values, epsilons)
+    comparison.to_csv("~/outputs/statistics/mechanism_comparison.csv", 
+                      sep = ";", index = False)
 
 # %%
