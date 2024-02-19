@@ -4,7 +4,8 @@
 
 # The code below is for the Gaussian kernel with fixed bandwidth, k(x,y) := exp(-||x-y||_2^2).
 # The bandwidth can be changed by scaling the input point coordinates.
-#%% Import and function defintions
+
+### Import and function defintions
 import numpy as np
 import pandas as pd
 import scipy as sp
@@ -34,7 +35,6 @@ def GaussianKDE(dataset, queries):
 ### LSQ with Random Fourier Features ###
 
 class LSQ_RFF:
-
     def __init__(self, dataset, dimension, reps):
         self.n = None
         self.d = dimension
@@ -192,7 +192,13 @@ class LSQ_FGT:
         return cdf_value
 
 class Mechanism:
-    def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, mechanism_parameters = None):
+    def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, epsilon: float = 1.0,
+                 domain_boundaries: tuple = (None, None), mechanism_parameters = None):
+        # input checks
+        assert isinstance(epsilon, float)
+        assert isinstance(domain_boundaries, tuple)
+        assert len(domain_boundaries) == 2
+        # save mechanism info
         self.mechanism_name = mechanism_name
         if mechanism_name == 'SCIPY':
             self.mechanism_class = gaussian_kde
@@ -201,49 +207,87 @@ class Mechanism:
         elif mechanism_name == 'LSQ_FGT':
             self.mechanism_class = LSQ_FGT
         self.sanitized = sanitized
+        self.epsilon = epsilon
+        self._x_lower_bound = domain_boundaries[0]
+        self._x_upper_bound = domain_boundaries[1]
         self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
         self._pdf_multiplicator = 1.0
         
-    def setup_mechanism(self, dataset, epsilon: int = 1.0):
+    def setup_mechanism(self, dataset, epsilon = None, domain_boundaries: tuple = None):
+        # check if input is a pandas series
+        if isinstance(dataset, pd.Series):
+           dataset = np.array(dataset).reshape((len(dataset), 1)) 
+        # save the dataset
+        self._params = {
+            'dataset': dataset,
+        }
+        # define lower and upper bound of the dataset
+        if domain_boundaries is None: 
+            std = dataset.std()
+            # factor 5 comes from the copulas module 
+            if self._x_lower_bound is None:
+                self._x_lower_bound = dataset.min() - 5 * std
+            if self._x_upper_bound is None:
+                self._x_upper_bound = dataset.max() + 5 * std
+        else:
+            assert isinstance(domain_boundaries, tuple)
+            assert len(domain_boundaries) == 2 
+            self._x_lower_bound = domain_boundaries[0]
+            self._x_upper_bound = domain_boundaries[1]
+        # normalize the dataset before fitting    
+        dataset = dataset.copy()
+        dataset = (dataset - self._x_lower_bound) / self._x_upper_bound
+        # check if epsilon has been overwritten
+        if epsilon:
+            self.epsilon = epsilon
+        # save the mechanism instance 
         if self.mechanism_name == 'SCIPY':
             self.mechanism_instance = self.mechanism_class(dataset.T, **self.mechanism_parameters)
         elif self.mechanism_name == 'LSQ_FGT':
             self.mechanism_instance = self.mechanism_class(dataset, 
                                                            dimension = 1, 
-                                                           coordinate_range = int(np.ceil(dataset.max() + 1)),
+                                                           coordinate_range = 2,
                                                            **self.mechanism_parameters)
             if self.sanitized:
-                self.mechanism_instance.sanitize(epsilon)
+                self.mechanism_instance.sanitize(self.epsilon)
         elif self.mechanism_name == 'LSQ_RFF':
             self.mechanism_instance = self.mechanism_class(dataset, 
                                                            dimension = 1, 
                                                            **self.mechanism_parameters)
             if self.sanitized:
-                self.mechanism_instance.sanitize(epsilon)
-        self._x_lower_bound = dataset.min()
-        self._x_upper_bound = dataset.max()
+                self.mechanism_instance.sanitize(self.epsilon)
         # Reset the multiplicator in case it was set before
         self._pdf_multiplicator = 1.0
         # Now set it to the actual value
         self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
     
     def compute_pdf(self, point):
+        # if the domain is bounded return 0 for values outside the boundaries
+        if point > self._x_upper_bound or point < self._x_lower_bound:
+            return 0
+        # otherwise compute pdf
         if self.mechanism_name == 'SCIPY':
             pdf = lambda x: self.mechanism_instance.pdf(np.array([x]))
         else:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
-        return(pdf(point) * self._pdf_multiplicator)
+        return pdf((point - self._x_lower_bound) / self._x_upper_bound) * self._pdf_multiplicator
         
     def compute_cdf_with_integral(self, end, start = None):
-        if start is None:
+        # check if the boundaries need to be tightened
+        if start and start < self._x_lower_bound:
             start = self._x_lower_bound
-        return integrate.quad(self.compute_pdf, start, end, limit = 1000, epsabs = 0.0001)[0]
+        if end > self._x_upper_bound:
+            end = self._x_upper_bound
+        start = 0 if start is None else (start - self._x_lower_bound) / self._x_upper_bound
+        end = (end - self._x_lower_bound) / self._x_upper_bound
+        return integrate.quad(self.compute_pdf, start, end, limit = 1000, epsabs = 10**-6)[0]
     
-    def inverse_cdf_with_integral(self, q):
+    def inverse_cdf_with_integral(self, q: float):
+        assert q >= 0 and q <= 1
         cdf_diff = lambda y: (self.compute_cdf_with_integral(y) - q)**2
-        return minimize_scalar(cdf_diff, bounds = (self._x_lower_bound, self._x_upper_bound))
-        
-            
+        optimization_result = minimize_scalar(cdf_diff, bounds = (self._x_lower_bound, self._x_upper_bound), tol = 10**-6)
+        return optimization_result.x
+    
 def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n: int):
     np.random.seed(42)
     sanitized = [mechanism.sanitized for mechanism in mechanisms]
@@ -257,22 +301,22 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
                              'epsilon': eps_col}
         choices = np.array(range(0, ds))
         # we normalize the dataset to speed up computation
-        dataset = np.random.choice(choices, (n, 1)) / (ds - 1)
+        dataset = np.random.choice(choices, (n, 1)) 
         cdfs = []
         # loop through the mechanisms
         for mechanism in mechanisms:
             # if mechanism is not sanitized only apply one kde
             if not mechanism.sanitized:
                 # setup the mechanism
-                mechanism.setup_mechanism(dataset)
+                mechanism.setup_mechanism(dataset, domain_boundaries = (0, ds - 1))
                 # compute the cdf value at the maximum value
-                cdfs.append(mechanism.compute_cdf_with_integral(1))
+                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1))
                 continue 
             for epsilon in epsilons:
                 # setup the mechanism
-                mechanism.setup_mechanism(dataset, epsilon)
+                mechanism.setup_mechanism(dataset, epsilon, domain_boundaries = (0, ds - 1))
                 # compute the cdf value at the maximum value
-                cdfs.append(mechanism.compute_cdf_with_integral(1))
+                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1))
         comparison_for_ds['domain_size'] = ds
         comparison_for_ds['cdf'] = cdfs
         comparison_for_ds = pd.DataFrame.from_dict(comparison_for_ds)
@@ -293,14 +337,14 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
         # if mechanism is not sanitized only apply one kde
         if not mechanism.sanitized:
             # setup the mechanism
-            mechanism.setup_mechanism(dataset)
+            mechanism.setup_mechanism(dataset, domain_boundaries = (0, 1))
             # compute the cdf value at the maximum value
             cdfs.append(mechanism.compute_cdf_with_integral(1))
             continue 
         # otherwise loop over epsilons
         for epsilon in epsilons:
             # setup the mechanism
-            mechanism.setup_mechanism(dataset, epsilon)
+            mechanism.setup_mechanism(dataset, epsilon, domain_boundaries = (0, 1))
             # compute the cdf value at the maximum value
             cdfs.append(mechanism.compute_cdf_with_integral(1))
     comparison_for_continuous['domain_size'] = math.inf
@@ -314,23 +358,5 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
         comparison = pd.concat([comparison, comparison_for_continuous], axis = 0, ignore_index = True)
     return comparison
     
-#%% Execute the demo
-if __name__ == '__main__':
-    ### Usage example ###
-    scipy_kde = Mechanism(mechanism_name = 'SCIPY')
-    lsq_rff_kde = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = False, mechanism_parameters = {'reps': 2000})
-    lsq_rff_kde_dp = Mechanism(mechanism_name = 'LSQ_RFF', sanitized = True, mechanism_parameters = {'reps': 2000})
-    lsq_fgt_kde = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 10})
-    lsq_fgt_kde_dp = Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 10})
-    mechanisms = [scipy_kde, lsq_rff_kde, lsq_rff_kde_dp, lsq_fgt_kde, lsq_fgt_kde_dp]
-    domain_sizes = [10**(i + 1) for i in range(4)]
-    epsilons = [10**(1 - i) for i in range(4)]
-    comparison = compare_mechanisms(mechanisms, domain_sizes, epsilons, n = 10**4)
-    #comparison.to_csv("~/outputs/statistics/mechanism_comparison.csv", 
-                      #sep = ";", index = False)
 
-# %% Read the computed comparison
-comparison = pd.read_csv("~/outputs/statistics/mechanism_comparison.csv", 
-                         sep = ";", 
-                         decimal = ".")
 # %%
