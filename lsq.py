@@ -9,11 +9,12 @@
 import numpy as np
 import pandas as pd
 import scipy as sp
-import scipy.integrate as integrate
 from scipy.stats import gaussian_kde
+import scipy.integrate as integrate
 from scipy.optimize import minimize_scalar
 import math
 
+import differential_privacy
 
 ### Auxiliary : computing squared-distance matrix ###
 
@@ -70,11 +71,16 @@ class LSQ_RFF:
         if sanitized:
             return self.private_kde(np.array(number))
         return self.non_private_kde(np.array(number))
+    
+    def kde_for_queries(self, queries, sanitized):
+        if sanitized:
+            return self.private_kde(queries)
+        else:
+            return self.non_private_kde(queries)
 
 ### LSQ with Fast Gauss Transform ###
 
 class LSQ_FGT:
-
     def __init__(self, dataset, dimension, coordinate_range, rho):
         self.n = None
         self.d = dimension
@@ -166,30 +172,12 @@ class LSQ_FGT:
     def private_kde(self, queries):
         return np.array([self.one_query_kde(query, True) for query in queries])
     
-    def approximate_cdf(self, query, sanitized=False):
-        """
-        Approximate the cumulative distribution function at a given query point.
-
-        Args:
-        - query: A single query point as a numpy array.
-        - sanitized: Boolean flag to use sanitized sketch or not.
-
-        Returns:
-        - Approximated CDF value at the query point.
-        """
-        # Generate a sequence of points from the minimum to the query point
-        points = np.linspace(0, query, num=100)  # Adjust the range and num as per your dataset
-        cdf_value = 0
+    def kde_for_queries(self, queries, sanitized):
+        if sanitized:
+            return self.private_kde(queries)
+        else:
+            return self.non_private_kde(queries)
         
-        for point in points:
-            # For each point, calculate the KDE and sum it to approximate the integral
-            point_kde = self.one_query_kde(np.array([point]), sanitized)
-            cdf_value += point_kde
-        
-        # Normalize the approximate integral by the number of points and the range
-        cdf_value /= len(points)
-        
-        return cdf_value
 
 class Mechanism:
     def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, epsilon: float = 1.0,
@@ -212,7 +200,7 @@ class Mechanism:
         self._x_upper_bound = domain_boundaries[1]
         self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
         self._pdf_multiplicator = 1.0
-        
+    
     def setup_mechanism(self, dataset, epsilon = None, domain_boundaries: tuple = None):
         # check if input is a pandas series
         if isinstance(dataset, pd.Series):
@@ -221,25 +209,41 @@ class Mechanism:
         self._params = {
             'dataset': dataset,
         }
-        # define lower and upper bound of the dataset
-        if domain_boundaries is None: 
-            std = dataset.std()
-            # factor 5 comes from the copulas module 
-            if self._x_lower_bound is None:
-                self._x_lower_bound = dataset.min() - 5 * std
-            if self._x_upper_bound is None:
-                self._x_upper_bound = dataset.max() + 5 * std
-        else:
-            assert isinstance(domain_boundaries, tuple)
-            assert len(domain_boundaries) == 2 
-            self._x_lower_bound = domain_boundaries[0]
-            self._x_upper_bound = domain_boundaries[1]
-        # normalize the dataset before fitting    
-        dataset = dataset.copy()
-        dataset = (dataset - self._x_lower_bound) / self._x_upper_bound
         # check if epsilon has been overwritten
         if epsilon:
+            self.sanitized = True
             self.epsilon = epsilon
+        # Reset the variables in case they were set before 
+        self._x_lower_bound = None
+        self._x_upper_bound = None
+        self._x_range = None
+        self._pdf_multiplicator = 1.0
+        # compute the differentially private boundaries if the method shall apply sanitization
+        if self.sanitized:
+            # compute the differentially private min and max
+            private_min, private_max = differential_privacy.compute_private_extremal_points(dataset, epsilon)   
+            # define lower and upper bound of the dataset
+            if domain_boundaries is not None:
+                assert isinstance(domain_boundaries, tuple)
+                assert len(domain_boundaries) == 2 
+                if domain_boundaries[0] is None or domain_boundaries[1] is None:
+                    std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
+                self._x_lower_bound = private_min - std if domain_boundaries[0] is None else domain_boundaries[0]
+                self._x_upper_bound = private_max + std if domain_boundaries[1] is None else domain_boundaries[1]
+            else:
+                std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
+                # factor 5 comes from the copulas module 
+                if self._x_lower_bound is None:
+                    self._x_lower_bound = private_min - std
+                if self._x_upper_bound is None:
+                    self._x_upper_bound = private_max + std
+        else:
+            self._x_lower_bound = dataset.min()
+            self._x_upper_bound = dataset.max()
+        self._x_range = self._x_upper_bound - self._x_lower_bound
+        # normalize the dataset before fitting    
+        dataset = dataset.copy()
+        dataset = (dataset - self._x_lower_bound) / self._x_range
         # save the mechanism instance 
         if self.mechanism_name == 'SCIPY':
             self.mechanism_instance = self.mechanism_class(dataset.T, **self.mechanism_parameters)
@@ -256,11 +260,16 @@ class Mechanism:
                                                            **self.mechanism_parameters)
             if self.sanitized:
                 self.mechanism_instance.sanitize(self.epsilon)
-        # Reset the multiplicator in case it was set before
-        self._pdf_multiplicator = 1.0
         # Now set it to the actual value
-        self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
+        #self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
     
+    def compute_pdfs_for_queries(self, queries):
+        if self.mechanism_name == 'SCIPY':
+            pdf = lambda x: self.mechanism_instance.pdf(x.T)
+        else:
+            pdf = lambda x: self.mechanism_instance.kde_for_queries(x, self.sanitized)
+        return pdf((queries - self._x_lower_bound) / self._x_range) * self._pdf_multiplicator
+        
     def compute_pdf(self, point):
         # if the domain is bounded return 0 for values outside the boundaries
         if point > self._x_upper_bound or point < self._x_lower_bound:
@@ -270,7 +279,7 @@ class Mechanism:
             pdf = lambda x: self.mechanism_instance.pdf(np.array([x]))
         else:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
-        return pdf((point - self._x_lower_bound) / self._x_upper_bound) * self._pdf_multiplicator
+        return pdf((point - self._x_lower_bound) / self._x_range) * self._pdf_multiplicator
         
     def compute_cdf_with_integral(self, end, start = None):
         # check if the boundaries need to be tightened
@@ -278,8 +287,7 @@ class Mechanism:
             start = self._x_lower_bound
         if end > self._x_upper_bound:
             end = self._x_upper_bound
-        start = 0 if start is None else (start - self._x_lower_bound) / self._x_upper_bound
-        end = (end - self._x_lower_bound) / self._x_upper_bound
+        start = 0 if start is None else start
         return integrate.quad(self.compute_pdf, start, end, limit = 1000, epsabs = 10**-6)[0]
     
     def inverse_cdf_with_integral(self, q: float):
@@ -308,15 +316,15 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
             # if mechanism is not sanitized only apply one kde
             if not mechanism.sanitized:
                 # setup the mechanism
-                mechanism.setup_mechanism(dataset, domain_boundaries = (0, ds - 1))
+                mechanism.setup_mechanism(dataset)
                 # compute the cdf value at the maximum value
-                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1))
+                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1, 0))
                 continue 
             for epsilon in epsilons:
                 # setup the mechanism
-                mechanism.setup_mechanism(dataset, epsilon, domain_boundaries = (0, ds - 1))
+                mechanism.setup_mechanism(dataset, epsilon)
                 # compute the cdf value at the maximum value
-                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1))
+                cdfs.append(mechanism.compute_cdf_with_integral(ds  - 1, 0))
         comparison_for_ds['domain_size'] = ds
         comparison_for_ds['cdf'] = cdfs
         comparison_for_ds = pd.DataFrame.from_dict(comparison_for_ds)
@@ -337,16 +345,16 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
         # if mechanism is not sanitized only apply one kde
         if not mechanism.sanitized:
             # setup the mechanism
-            mechanism.setup_mechanism(dataset, domain_boundaries = (0, 1))
+            mechanism.setup_mechanism(dataset)
             # compute the cdf value at the maximum value
-            cdfs.append(mechanism.compute_cdf_with_integral(1))
+            cdfs.append(mechanism.compute_cdf_with_integral(1, 0))
             continue 
         # otherwise loop over epsilons
         for epsilon in epsilons:
             # setup the mechanism
-            mechanism.setup_mechanism(dataset, epsilon, domain_boundaries = (0, 1))
+            mechanism.setup_mechanism(dataset, epsilon)
             # compute the cdf value at the maximum value
-            cdfs.append(mechanism.compute_cdf_with_integral(1))
+            cdfs.append(mechanism.compute_cdf_with_integral(1, 0))
     comparison_for_continuous['domain_size'] = math.inf
     comparison_for_continuous['cdf'] = cdfs
     comparison_for_continuous = pd.DataFrame.from_dict(comparison_for_continuous)
@@ -357,6 +365,3 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
     else:
         comparison = pd.concat([comparison, comparison_for_continuous], axis = 0, ignore_index = True)
     return comparison
-    
-
-# %%
