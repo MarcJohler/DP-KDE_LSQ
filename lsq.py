@@ -228,18 +228,17 @@ class Mechanism:
                 assert len(domain_boundaries) == 2 
                 if domain_boundaries[0] is None or domain_boundaries[1] is None:
                     std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
-                self._x_lower_bound = private_min - std if domain_boundaries[0] is None else domain_boundaries[0]
-                self._x_upper_bound = private_max + std if domain_boundaries[1] is None else domain_boundaries[1]
+                self._x_lower_bound = private_min if domain_boundaries[0] is None else domain_boundaries[0]
+                self._x_upper_bound = private_max if domain_boundaries[1] is None else domain_boundaries[1]
             else:
                 std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
-                # factor 5 comes from the copulas module 
-                if self._x_lower_bound is None:
-                    self._x_lower_bound = private_min - std
-                if self._x_upper_bound is None:
-                    self._x_upper_bound = private_max + std
+                self._x_lower_bound = private_min
+                self._x_upper_bound = private_max
         else:
             self._x_lower_bound = dataset.min()
             self._x_upper_bound = dataset.max()
+        # check if compute lower and upper bound are reasonable
+        assert self._x_upper_bound > self._x_lower_bound
         self._x_range = self._x_upper_bound - self._x_lower_bound
         # normalize the dataset before fitting    
         dataset = dataset.copy()
@@ -261,7 +260,7 @@ class Mechanism:
             if self.sanitized:
                 self.mechanism_instance.sanitize(self.epsilon)
         # Now set it to the actual value
-        #self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
+        self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound)
     
     def compute_pdfs_for_queries(self, queries):
         if self.mechanism_name == 'SCIPY':
@@ -279,7 +278,7 @@ class Mechanism:
             pdf = lambda x: self.mechanism_instance.pdf(np.array([x]))
         else:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
-        return pdf((point - self._x_lower_bound) / self._x_range) * self._pdf_multiplicator
+        return pdf((point - self._x_lower_bound) / self._x_range) * (self._pdf_multiplicator / self._x_range)
         
     def compute_cdf_with_integral(self, end, start = None):
         # check if the boundaries need to be tightened
@@ -287,8 +286,9 @@ class Mechanism:
             start = self._x_lower_bound
         if end > self._x_upper_bound:
             end = self._x_upper_bound
-        start = 0 if start is None else start
-        return integrate.quad(self.compute_pdf, start, end, limit = 1000, epsabs = 10**-6)[0]
+        start = self._x_lower_bound if start is None else start
+        compute_pdf = lambda x: self.compute_pdf(x)
+        return integrate.quad(compute_pdf, start, end, limit = 1000, epsabs = 10**-6)[0]
     
     def inverse_cdf_with_integral(self, q: float):
         assert q >= 0 and q <= 1
@@ -365,3 +365,5 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
     else:
         comparison = pd.concat([comparison, comparison_for_continuous], axis = 0, ignore_index = True)
     return comparison
+
+# %%

@@ -1,7 +1,7 @@
 #%% Imports
 import numpy as np
 import pandas as pd
-from lsq import Mechanism, compare_mechanisms
+from lsq import GaussianKDE, Mechanism, compare_mechanisms, LSQ_FGT
 
 #%% Compare the mechanisms
 if __name__ == '__main__':
@@ -40,47 +40,28 @@ queries = np.random.choice(choices, (n_queries, dimension), p = probs)
 # paper config
 dataset = np.random.uniform(0, coordinate_range-1, (n_data, dimension))
 queries = np.random.uniform(0, coordinate_range-1, (n_queries, dimension))
-
-lsq_fgt_test =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 4})
+queries = np.sort(queries)
+lsq_fgt_test =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 4}, domain_boundaries=(0, 13))
 lsq_fgt_test.setup_mechanism(dataset)
-
-scipy_test = Mechanism(mechanism_name = "SCIPY")
-scipy_test.setup_mechanism(dataset)
-
-
-#%%
-
-def get_sqdistance_matrix(M1, M2):
-    allsqnorms = np.linalg.norm(np.vstack([M1,M2]), axis=1).reshape(-1, 1)**2
-    M1sqnorms = allsqnorms[:M1.shape[0],:]
-    M2sqnorms = allsqnorms[M1.shape[0]:,:].reshape(1, -1)
-    dm = M1sqnorms + M2sqnorms - 2.0 * np.dot(M1, M2.T)
-    dm[dm < 0.0] = 0.0
-    return dm
-
-### Exact KDE ###
-def GaussianKDE(dataset, queries):
-    exp_sq_dist_matrix = np.exp(-1 * get_sqdistance_matrix(dataset, queries))
-    return np.mean(exp_sq_dist_matrix, axis=0).T
-
-#%%
-min = np.floor(dataset.min())
-max = np.ceil(dataset.max())
 # Exact Gaussian KDE:
-exact_kde = scipy_test.compute_pdfs_for_queries(queries)
-exact_kde2 = GaussianKDE((dataset - min) / (max - min), (queries - min) / (max - min))
-exact_kde3 = GaussianKDE(dataset, queries)
-np.mean(np.abs(exact_kde - exact_kde3))
-
-#%%
+exact_kde = GaussianKDE(dataset, queries)
+# without my class
+mechanism = LSQ_FGT(dataset, dimension, coordinate_range, 4)
+non_dp_no_class = mechanism.non_private_kde(queries)
 # Non-DP KDE estimates:
 non_dp_kde_estimate = lsq_fgt_test.compute_pdfs_for_queries(queries)
-print("Non-DP estimate:", non_dp_kde_estimate)
 print("Mean error:", np.mean(np.abs(exact_kde - non_dp_kde_estimate)))
 # DP KDE estimates:
 lsq_fgt_test.setup_mechanism(dataset, epsilon = 0.1)
 dp_kde_estimate = lsq_fgt_test.compute_pdfs_for_queries(queries)
-print("DP estimate:", dp_kde_estimate)
 print("Mean error:", np.mean(np.abs(exact_kde - dp_kde_estimate)))
 
+#%%
+import matplotlib.pyplot as plt
+plt.plot(queries[:, 0], non_dp_no_class, label = "Non DP (No class)")
+plt.plot(queries[:, 0], exact_kde, label = "Exact")
+plt.plot(queries[:, 0], non_dp_kde_estimate, label = "Non DP")
+plt.plot(queries[:, 0], dp_kde_estimate, label = "DP")
+plt.legend()
+plt.show()
 # %%
