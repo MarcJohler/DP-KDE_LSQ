@@ -53,11 +53,11 @@ queries = queries.reshape((len(queries), 1))
 #queries = np.random.uniform(0, coordinate_range-1, (n_queries, dimension))
 #queries = np.sort(queries)
 # Scipy KDE:
-scipy_kde_test = Mechanism(mechanism_name = 'SCIPY', domain_boundaries=(0, maximum), mechanism_parameters = {'bw_method': 'silverman'})
+scipy_kde_test = Mechanism(mechanism_name = 'SCIPY', mechanism_parameters = {'bw_method': 'scott'}, domain_boundaries=(0, maximum))
 scipy_kde_test.setup_mechanism(dataset)
 scipy_kde_test_estimates = scipy_kde_test.compute_pdfs_for_queries(queries)
 # Exact Gaussian KDE:
-exact_kde_test = Mechanism(mechanism_name = 'Exact', domain_boundaries=(0, maximum ), mechanism_parameters = {'bandwidth': 'silverman'})
+exact_kde_test = Mechanism(mechanism_name = 'Exact', mechanism_parameters = {'bandwidth': 'scott'}, domain_boundaries=(0, maximum ))
 exact_kde_test.setup_mechanism(dataset)
 exact_kde_test_estimates = exact_kde_test.compute_pdfs_for_queries(queries)
 # LSQ FGT KDE non-DP
@@ -80,5 +80,5 @@ plt.title(col)
 plt.legend()
 plt.show()
 # %%
-lsq_fgt_test.integrate_box_1d(0, -10000)
+
 # %%

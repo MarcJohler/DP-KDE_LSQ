@@ -15,8 +15,9 @@ from scipy import special
 from scipy.optimize import minimize_scalar
 import math
 
+from scipy.special import ndtr
+
 import differential_privacy
-from new_fgt import LSQ_FGT
 
 ### Auxiliary : computing squared-distance matrix ###
 def get_sqdistance_matrix(M1, M2):
@@ -329,12 +330,40 @@ class Mechanism:
     def compute_cdf_with_integral(self, end, start = None):
         start = self._x_lower_bound - 6 * self._std if start is None else start
         compute_pdf = lambda x: self.compute_pdf(x)
-        return integrate.quad(compute_pdf, start, end, limit = 1000, epsabs = 10**-6)[0]
+        return integrate.quad(compute_pdf, start, end, limit = 100, epsabs = 10**-8)[0]
+    
+    def compute_cdf(self, X):
+        """Compute the cumulative distribution value for each point in X.
+
+        Arguments:
+            X (numpy.ndarray):
+                Values for which the cumulative distribution will be computed.
+                It must have shape (n, 1).
+
+        Returns:
+            numpy.ndarray:
+                Cumulative distribution values for points in X.
+
+        Raises:
+            NotFittedError:
+                if the model is not fitted.
+        """
+        X = np.atleast_2d(np.array([X])).T
+        lower = ndtr((self._x_lower_bound - 6 * self._std - self._params['dataset']) / self._std)[0]
+        uppers = ndtr((X[:, None] - self._params['dataset']) / self._std)
+        return np.sum((uppers - lower) / self._params['dataset'].shape[0])
     
     def inverse_cdf_with_integral(self, q: float):
         assert q >= 0 and q <= 1
-        cdf_diff = lambda y: (self.compute_cdf_with_integral(y) - q)**2
-        optimization_result = minimize_scalar(cdf_diff, bounds = (self._x_lower_bound, self._x_upper_bound), tol = 10**-6)
+        # adapt q to avoid machine precisions precision problems
+        if q < np.finfo(np.float32).eps:
+            q = np.finfo(np.float32).eps
+        if q > 1 - np.finfo(np.float32).eps:
+            q = 1 - np.finfo(np.float32).eps
+        cdf_diff = lambda y: (self.compute_cdf(y) - q)**2
+        optimization_result = minimize_scalar(cdf_diff, 
+                                              bounds = (self._x_lower_bound, self._x_upper_bound), 
+                                              tol = 10**-8, options = {'maxiter': 25})
         return optimization_result.x
     
 def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n: int):
