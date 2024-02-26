@@ -46,14 +46,10 @@ def calculate_bandwidth(dataset: np.array, bandwidth: None):
         
 
 ### Exact KDE ###
-def GaussianKDE(dataset, queries):
-    exp_sq_dist_matrix = np.exp(-1 * get_sqdistance_matrix(dataset, queries))
-    return np.mean(exp_sq_dist_matrix, axis=0).T
-
 def GaussianKDE(dataset, queries, bandwidth = None):
     exp_sq_dist_matrix = np.exp(-0.5 * get_sqdistance_matrix(dataset / bandwidth, queries / bandwidth))
-    normalization_factor = (2 * np.pi * bandwidth**2) ** (dataset.shape[1] / 2)
-    return np.mean(exp_sq_dist_matrix, axis=0) / normalization_factor
+    normalization_factor = 1 / ((2 * np.pi * bandwidth**2) ** (dataset.shape[1] / 2))
+    return np.mean(exp_sq_dist_matrix, axis=0) * normalization_factor
 
 class ExactGaussianKDE:
     def __init__(self, dataset, bandwidth = None):
@@ -114,15 +110,19 @@ class LSQ_RFF:
 ### LSQ with Fast Gauss Transform ###
 
 class LSQ_FGT:
-    def __init__(self, dataset, dimension, coordinate_range, rho, bandwidth = None):
+    def __init__(self, dataset, dimension, coordinate_range, rho, bandwidth = None, boundaries = None):
+        self.bandwidth = calculate_bandwidth(dataset, bandwidth)
+        self.dataset = dataset 
+        self.boundaries = boundaries
         self.n = None
         self.d = dimension
-        self.small_radius_squared = rho
+        self.small_radius_squared = rho 
         self.rho = rho
-        self.bandwidth = calculate_bandwidth(dataset, bandwidth)
+        self._pdf_multiplicator = 1.0
         # depends on bandwidth
         self.coordinate_range = int(np.ceil(coordinate_range / self.bandwidth))
-
+        self.coordinate_range = coordinate_range
+        
         # Sketch
         self.sketch = np.zeros((self.coordinate_range ** self.d, self.rho ** self.d))
         self.sanitized_sketch = None
@@ -136,7 +136,7 @@ class LSQ_FGT:
         # Hermite polynomials
         self.hermite_polynomials = [sp.special.hermite(j) for j in np.arange(self.rho)]
 
-        self.sketch_dataset(dataset)
+        self.sketch_dataset(self.dataset)
 
     def sketch_dataset(self, dataset):
         self.n = dataset.shape[0]
@@ -145,21 +145,21 @@ class LSQ_FGT:
             return
 
         # Partition dataset into hypercubes
-        rounded_dataset = np.rint(dataset / self.bandwidth)
+        rounded_dataset = np.rint(dataset) 
         # Compute the index of the cell containing each data point
         cell_indices = rounded_dataset.dot(self.aux_dim0_powers).astype(np.dtype(int))
         
         if self.rho == 1:
             np.add.at(self.sketch[:, 0], cell_indices, np.ones(self.n))
         elif self.d == 2:
-            residual_dataset = (dataset / self.bandwidth) - rounded_dataset
+            residual_dataset = dataset - rounded_dataset
             all_powers = np.einsum('nk,nl->nkl',
                                    np.vstack([residual_dataset[:, 0]**j for j in range(self.rho)]).T,
                                    np.vstack([residual_dataset[:, 1]**j for j in range(self.rho)]).T
                                    ).reshape(self.n, -1)
             np.add.at(self.sketch, cell_indices, all_powers)
         else:
-            residual_dataset = (dataset / self.bandwidth) - rounded_dataset
+            residual_dataset = dataset - rounded_dataset
             for idx, idx_tuple in enumerate(self.aux_dim1_tuples):
                 np.add.at(self.sketch[:, idx], cell_indices, np.prod(np.power(residual_dataset, idx_tuple), axis=1))
 
@@ -170,13 +170,14 @@ class LSQ_FGT:
                                 np.random.laplace(0, self.noise_scale * 1. / (epsilon * self.n), self.sketch.shape)
 
     def g(self, query):
+        query = query.copy() 
         # Compute the cells which are close enough to matter
-        cell_distances = get_sqdistance_matrix(query.reshape(1, -1) / self.bandwidth, self.aux_dim0_tuples / self.bandwidth)
+        cell_distances = get_sqdistance_matrix(query.reshape(1, -1), self.aux_dim0_tuples)
         relevant_cells = np.where(cell_distances.ravel() <= self.small_radius_squared)[0]
 
         # Compute normalized hermite functions of all query residual coordinates in relevant cells
         # (Denominator turns hermite polynomial to hermite function)
-        q_residuals = query / self.bandwidth - self.aux_dim0_tuples[relevant_cells, :] / self.bandwidth
+        q_residuals = query  - self.aux_dim0_tuples[relevant_cells, :] 
         denominator = np.exp(q_residuals ** 2)
         hermite_evaluations = [(1. / np.math.factorial(j)) *
                                self.hermite_polynomials[j](q_residuals) / denominator for j in np.arange(self.rho)]
@@ -195,10 +196,15 @@ class LSQ_FGT:
         else:
             dataset_sketch = self.sketch
         q_sketch, relevant_cells = self.g(query)
-        return dataset_sketch[relevant_cells, :].ravel().dot(q_sketch.ravel())
+        normalization_factor = 1 / ((2 * np.pi * self.bandwidth**2) ** (self.d / 2))
+        return dataset_sketch[relevant_cells, :].ravel().dot(q_sketch.ravel()) * normalization_factor * self._pdf_multiplicator
     
     def one_number_kde(self, number: float, sanitized: bool):
         return self.one_query_kde(np.array(number), sanitized)
+    
+    def compute_correction_factor(self, sanitized: bool):
+        kde = lambda x: self.one_number_kde(x, sanitized)
+        self._pdf_multiplicator *= 1 / (integrate.quad(kde, self.boundaries[0], self.boundaries[1], limit = 100, epsabs = 10**-8)[0])
 
     def non_private_kde(self, queries):
         return np.array([self.one_query_kde(query, False) for query in queries])
@@ -232,10 +238,10 @@ class Mechanism:
             self.mechanism_class = ExactGaussianKDE
         self.sanitized = sanitized
         self.epsilon = epsilon
-        self._x_lower_bound = domain_boundaries[0]
-        self._x_upper_bound = domain_boundaries[1]
+        assert isinstance(domain_boundaries, tuple)
+        assert len(domain_boundaries) == 2
+        self.domain_boundaries = domain_boundaries
         self.mechanism_parameters = mechanism_parameters if mechanism_parameters is not None else {}
-        self._pdf_multiplicator = 1.0
     
     def setup_mechanism(self, dataset, epsilon = None, domain_boundaries: tuple = None):
         # check if input is a pandas series
@@ -253,27 +259,27 @@ class Mechanism:
         self._x_lower_bound = None
         self._x_upper_bound = None
         self._x_range = None
-        self._pdf_multiplicator = 1.0
         # compute the differentially private boundaries if the method shall apply sanitization
+        if domain_boundaries is not None:
+            assert isinstance(domain_boundaries, tuple)
+            assert len(domain_boundaries) == 2 
+            self.domain_boundaries = domain_boundaries
         if self.sanitized:
             # compute the differentially private min and max
             private_min, private_max = differential_privacy.compute_private_extremal_points(dataset, epsilon)
-            self._std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)   
             # define lower and upper bound of the dataset
-            if domain_boundaries is not None:
-                assert isinstance(domain_boundaries, tuple)
-                assert len(domain_boundaries) == 2 
-                if domain_boundaries[0] is None or domain_boundaries[1] is None:
-                    std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
-                self._x_lower_bound = private_min if domain_boundaries[0] is None else domain_boundaries[0]
-                self._x_upper_bound = private_max if domain_boundaries[1] is None else domain_boundaries[1]
-            else:
-                std = differential_privacy.compute_private_std(dataset, (private_min, private_max), epsilon)
-                if self._x_lower_bound is None:
-                    self._x_lower_bound = private_min
-                if self._x_upper_bound is None:
-                    self._x_upper_bound = private_max
+            if self.domain_boundaries is not None:
+                self._x_lower_bound = self.domain_boundaries[0] 
+                self._x_upper_bound = self.domain_boundaries[1] 
+            if self._x_lower_bound is None:
+                self._x_lower_bound = private_min
+            if self._x_upper_bound is None:
+                self._x_upper_bound = private_max
+            self._std = differential_privacy.compute_private_std(dataset, (self._x_lower_bound, self._x_upper_bound), epsilon)   
         else:
+            if self.domain_boundaries is not None:
+                self._x_lower_bound = self.domain_boundaries[0]
+                self._x_upper_bound = self.domain_boundaries[1]
             if self._x_lower_bound is None:
                 self._x_lower_bound = dataset.min()
             if self._x_upper_bound is None:
@@ -288,10 +294,13 @@ class Mechanism:
         elif self.mechanism_name == 'LSQ_FGT':
             self.mechanism_instance = self.mechanism_class(dataset, 
                                                            dimension = 1, 
-                                                           coordinate_range = int(self._x_range + 1),
+                                                           coordinate_range = int(np.ceil(self._x_range + 1)),
+                                                           boundaries = (self._x_lower_bound - self._std * 6, 
+                                                                         self._x_upper_bound + self._std * 6),
                                                            **self.mechanism_parameters)
             if self.sanitized:
                 self.mechanism_instance.sanitize(self.epsilon)
+            self.mechanism_instance.compute_correction_factor(self.sanitized)
         elif self.mechanism_name == 'LSQ_RFF':
             self.mechanism_instance = self.mechanism_class(dataset, 
                                                            dimension = 1, 
@@ -301,8 +310,6 @@ class Mechanism:
         elif self.mechanism_name == 'Exact':
             self.mechanism_instance = self.mechanism_class(dataset,
                                                            **self.mechanism_parameters)
-        # Now set it to the actual value
-        self._pdf_multiplicator = 1.0 / self.compute_cdf_with_integral(self._x_upper_bound + 6 * self._std)
     
     def compute_pdfs_for_queries(self, queries):
         # reshape the queries
@@ -325,7 +332,7 @@ class Mechanism:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x)
         else:
             pdf = lambda x: self.mechanism_instance.one_number_kde(x, self.sanitized)
-        return pdf(point) 
+        return pdf(point)
         
     def compute_cdf_with_integral(self, end, start = None):
         start = self._x_lower_bound - 6 * self._std if start is None else start
@@ -353,7 +360,7 @@ class Mechanism:
         uppers = ndtr((X[:, None] - self._params['dataset']) / self._std)
         return np.sum((uppers - lower) / self._params['dataset'].shape[0])
     
-    def inverse_cdf_with_integral(self, q: float):
+    def inverse_cdf(self, q: float):
         assert q >= 0 and q <= 1
         # adapt q to avoid machine precisions precision problems
         if q < np.finfo(np.float32).eps:

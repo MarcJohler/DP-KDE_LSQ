@@ -24,49 +24,50 @@ comparison = pd.read_csv("~/outputs/statistics/mechanism_comparison.csv",
                          decimal = ".")
 
 #%%
-n = 10000
+#n = 10000
 col = 'pi_max_gehstrecke'
 maximum = 13
+bw = 1.0
 data = pd.read_csv("~/test_data/edss_time_interval_COMPLETE_train.csv", 
                    sep = ";", 
                    decimal = ".",
                    parse_dates = [1])
 
 # make a dataset sample of pi_max_gehstrecke
-np.random.seed(42)
-sample = np.random.choice(data.index, n)
-dataset = data.loc[sample, col]
-queries = np.arange(data[col].min() - 1, data[col].max(), step = 0.25)
-queries = queries.reshape((len(queries), 1))
+#np.random.seed(42)
+#sample = np.random.choice(data.index, n)
+#dataset = data.loc[sample, col]
+#queries = np.arange(data[col].min() - 1, data[col].max(), step = 0.125)
+#queries = queries.reshape((len(queries), 1))
  
 # Generate random dataset and queries:
-#dimension = 1
-#coordinate_range = 2
-#n_data = 100000
-#n_queries = 1000
-#choices = np.array(range(coordinate_range))
-#probs = choices / np.sum(choices)
-#dataset = np.random.choice(choices, (n_data, dimension), p = probs)
-#queries = np.random.choice(choices, (n_queries, dimension), p = probs)
+dimension = 1
+coordinate_range = 14
+n_data = 100000
+n_queries = 1000
+choices = np.array(range(coordinate_range))
+probs = choices / np.sum(choices)
+dataset = np.random.choice(choices, (n_data, dimension), p = probs)
+queries = np.random.choice(choices, (n_queries, dimension), p = probs)
 # paper config
 #dataset = np.random.uniform(0, coordinate_range-1, (n_data, dimension))
 #queries = np.random.uniform(0, coordinate_range-1, (n_queries, dimension))
-#queries = np.sort(queries)
+queries = np.sort(queries, axis = 0)
 # Scipy KDE:
-scipy_kde_test = Mechanism(mechanism_name = 'SCIPY', mechanism_parameters = {'bw_method': 'scott'}, domain_boundaries=(0, maximum))
+scipy_kde_test = Mechanism(mechanism_name = 'SCIPY', mechanism_parameters = {'bw_method': bw}, domain_boundaries=(0, maximum))
 scipy_kde_test.setup_mechanism(dataset)
 scipy_kde_test_estimates = scipy_kde_test.compute_pdfs_for_queries(queries)
 # Exact Gaussian KDE:
-exact_kde_test = Mechanism(mechanism_name = 'Exact', mechanism_parameters = {'bandwidth': 'scott'}, domain_boundaries=(0, maximum ))
+exact_kde_test = Mechanism(mechanism_name = 'Exact', mechanism_parameters = {'bandwidth': bw}, domain_boundaries=(0, maximum ))
 exact_kde_test.setup_mechanism(dataset)
 exact_kde_test_estimates = exact_kde_test.compute_pdfs_for_queries(queries)
 # LSQ FGT KDE non-DP
-lsq_fgt_test =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 4, 'bandwidth': 0.5}, domain_boundaries = (0, maximum))
+lsq_fgt_test =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = False, mechanism_parameters = {'rho': 4, 'bandwidth': bw}, domain_boundaries = (0, maximum))
 lsq_fgt_test.setup_mechanism(dataset)
 lsq_fgt_test_estimates = lsq_fgt_test.compute_pdfs_for_queries(queries)
 print("Mean error Non-DP:", np.mean(np.abs(exact_kde_test_estimates - lsq_fgt_test_estimates)))
 # LSQ FGT KDE DP
-lsq_fgt_test_dp =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 4, 'bandwidth': 0.5}, domain_boundaries = (0, maximum))
+lsq_fgt_test_dp =  Mechanism(mechanism_name = 'LSQ_FGT', sanitized = True, mechanism_parameters = {'rho': 4, 'bandwidth': bw}, domain_boundaries = (0, maximum))
 lsq_fgt_test_dp.setup_mechanism(dataset, epsilon = 1.0)
 lsq_fgt_test_dp_estimates = lsq_fgt_test_dp.compute_pdfs_for_queries(queries)
 print("Mean error DP:", np.mean(np.abs(exact_kde_test_estimates - lsq_fgt_test_dp_estimates)))
@@ -80,5 +81,5 @@ plt.title(col)
 plt.legend()
 plt.show()
 # %%
-
+lsq_fgt_test_dp.compute_cdf(13.0)
 # %%
