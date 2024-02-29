@@ -121,7 +121,7 @@ class LSQ_FGT:
         self._pdf_multiplicator = 1.0
         # depends on bandwidth
         self.coordinate_range = int(np.ceil(coordinate_range / self.bandwidth))
-        self.coordinate_range = coordinate_range
+        #self.coordinate_range = coordinate_range
         
         # Sketch
         self.sketch = np.zeros((self.coordinate_range ** self.d, self.rho ** self.d))
@@ -136,7 +136,7 @@ class LSQ_FGT:
         # Hermite polynomials
         self.hermite_polynomials = [sp.special.hermite(j) for j in np.arange(self.rho)]
 
-        self.sketch_dataset(self.dataset)
+        self.sketch_dataset(self.dataset / self.bandwidth)
 
     def sketch_dataset(self, dataset):
         self.n = dataset.shape[0]
@@ -170,7 +170,7 @@ class LSQ_FGT:
                                 np.random.laplace(0, self.noise_scale * 1. / (epsilon * self.n), self.sketch.shape)
 
     def g(self, query):
-        query = query.copy() 
+        query = query.copy() / self.bandwidth
         # Compute the cells which are close enough to matter
         cell_distances = get_sqdistance_matrix(query.reshape(1, -1), self.aux_dim0_tuples)
         relevant_cells = np.where(cell_distances.ravel() <= self.small_radius_squared)[0]
@@ -220,7 +220,7 @@ class LSQ_FGT:
         
 
 class Mechanism:
-    def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, epsilon: float = 1.0,
+    def __init__(self, mechanism_name = 'SCIPY', sanitized: bool = False, epsilon: float = 1.0, 
                  domain_boundaries: tuple = (None, None), mechanism_parameters = None):
         # input checks
         assert isinstance(epsilon, float)
@@ -251,6 +251,8 @@ class Mechanism:
         self._params = {
             'dataset': dataset,
         }
+        # do I have to privatize the weights? 
+        self._weights = np.repeat(1 / dataset.shape[0], dataset.shape[0])
         # check if epsilon has been overwritten
         if epsilon:
             self.sanitized = True
@@ -313,7 +315,7 @@ class Mechanism:
     
     def compute_pdfs_for_queries(self, queries):
         # reshape the queries
-        if isinstance(queries, pd.Series):
+        if isinstance(queries, pd.Series) or len(queries.shape) == 1:
            queries = np.array(queries).reshape((len(queries), 1)) 
         # define pdf according to chosen mechanism
         if self.mechanism_name == 'SCIPY':
@@ -337,15 +339,14 @@ class Mechanism:
     def compute_cdf_with_integral(self, end, start = None):
         start = self._x_lower_bound - 6 * self._std if start is None else start
         compute_pdf = lambda x: self.compute_pdf(x)
-        return integrate.quad(compute_pdf, start, end, limit = 100, epsabs = 10**-8)[0]
+        return integrate.quad(compute_pdf, start, end, limit = 10, epsabs = 10**-4)[0]
     
     def compute_cdf(self, X):
         """Compute the cumulative distribution value for each point in X.
 
         Arguments:
-            X (numpy.ndarray):
-                Values for which the cumulative distribution will be computed.
-                It must have shape (n, 1).
+            X (float):
+                A number for which the CDF shall be computed.
 
         Returns:
             numpy.ndarray:
@@ -355,10 +356,16 @@ class Mechanism:
             NotFittedError:
                 if the model is not fitted.
         """
-        X = np.atleast_2d(np.array([X])).T
-        lower = ndtr((self._x_lower_bound - 6 * self._std - self._params['dataset']) / self._std)[0]
-        uppers = ndtr((X[:, None] - self._params['dataset']) / self._std)
-        return np.sum((uppers - lower) / self._params['dataset'].shape[0])
+        X = np.atleast_1d(X)
+        lower = ndtr((self._x_lower_bound - 6 * self._std - self._params['dataset'].T) / self._std)[0]
+        uppers = ndtr((X[:, None] - self._params['dataset'].T) / self._std)
+        cdf_vals = (uppers - lower).dot(self._weights)
+        if self.sanitized:
+            # Do we need extra noise for weights? Yes - noise auf self_weights darauf und normalisieren
+            # Dann muss maximum nicht mehr privatisiert werden.
+            # Mathematical reasoning - why does this work?
+            cdf_vals = differential_privacy.laplace_mechanism(cdf_vals, self._weights.max(), self.epsilon, size = cdf_vals.shape)
+        return cdf_vals
     
     def inverse_cdf(self, q: float):
         assert q >= 0 and q <= 1
@@ -370,8 +377,11 @@ class Mechanism:
         cdf_diff = lambda y: (self.compute_cdf(y) - q)**2
         optimization_result = minimize_scalar(cdf_diff, 
                                               bounds = (self._x_lower_bound, self._x_upper_bound), 
-                                              tol = 10**-8, options = {'maxiter': 25})
+                                              tol = 10**-8, options = {'maxiter': 100})
         return optimization_result.x
+    
+    def percent_point(self, U: float):
+        return np.array([self.inverse_cdf(u) for u in U])
     
 def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n: int):
     np.random.seed(42)
@@ -443,4 +453,3 @@ def compare_mechanisms(mechanisms: list, domain_sizess: list, epsilons: list, n:
         comparison = pd.concat([comparison, comparison_for_continuous], axis = 0, ignore_index = True)
     return comparison
 
-# %%
